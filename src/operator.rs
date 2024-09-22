@@ -3,9 +3,12 @@
 
 use datafusion::{
     arrow::{
-        array::AsArray, compute::filter_record_batch, datatypes::Schema, record_batch::RecordBatch,
+        array::{ArrayRef, AsArray},
+        compute::{concat_batches, filter_record_batch, sort_to_indices, SortOptions},
+        datatypes::{Schema, SchemaRef},
+        record_batch::RecordBatch,
     },
-    physical_plan::PhysicalExpr,
+    physical_plan::{sorts::sort::sort_batch, PhysicalExpr},
 };
 use std::sync::Arc;
 
@@ -17,9 +20,10 @@ enum Result {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    Source,
     Scan,
     Filter,
-    Project,
+    Projection,
     Limit,
     Sort,
     HashAggregate,
@@ -117,18 +121,137 @@ impl PipelinedOperator for Scan {
     }
 }
 
+/// Projection operator.
+struct Projection {
+    child: Box<dyn PipelinedOperator>,
+    indices: Vec<usize>,
+    output_schema: SchemaRef,
+}
+
+impl Projection {
+    fn new(
+        child: Box<dyn PipelinedOperator>,
+        indices: Vec<usize>,
+        input_schema: SchemaRef,
+    ) -> Self {
+        let projected_fields: Vec<_> = indices
+            .iter()
+            .map(|&i| input_schema.field(i).clone())
+            .collect();
+        let output_schema = Arc::new(Schema::new(projected_fields));
+
+        Self {
+            child,
+            indices,
+            output_schema,
+        }
+    }
+}
+
+impl PhysicalOperator for Projection {
+    fn kind(&self) -> Kind {
+        Kind::Projection
+    }
+}
+
+impl PipelinedOperator for Projection {
+    fn execute(&mut self, batch: Arc<RecordBatch>) -> Result {
+        let input_batch = match self.child.execute(batch) {
+            Result::Ok(batch) => batch,
+            Result::Done => return Result::Done,
+        };
+
+        let projected_columns: Vec<ArrayRef> = self
+            .indices
+            .iter()
+            .map(|&i| input_batch.column(i).clone())
+            .collect();
+
+        let projected_batch = RecordBatch::try_new(self.output_schema.clone(), projected_columns)
+            .map_err(|e| format!("Error creating projected batch: {}", e));
+
+        match projected_batch {
+            Ok(batch) => Result::Ok(Arc::new(batch)),
+            Err(issue) => panic!("Encountered an issue building the last batch {issue}"),
+        }
+    }
+}
+
+// Limit operator.
+struct Limit {
+    child: Box<dyn PipelinedOperator>,
+    limit: usize,
+    emitted: usize,
+}
+
+impl Limit {
+    fn new(child: Box<dyn PipelinedOperator>, limit: usize) -> Self {
+        Self {
+            child,
+            limit,
+            emitted: 0,
+        }
+    }
+}
+
+impl PhysicalOperator for Limit {
+    fn kind(&self) -> Kind {
+        Kind::Limit
+    }
+}
+
+impl PipelinedOperator for Limit {
+    fn execute(&mut self, batch: Arc<RecordBatch>) -> Result {
+        if self.emitted >= self.limit {
+            return Result::Done;
+        }
+
+        let input_batch = match self.child.execute(batch) {
+            Result::Ok(batch) => batch,
+            Result::Done => return Result::Done,
+        };
+        let remaining = self.limit - self.emitted;
+        let output_rows = std::cmp::min(remaining, input_batch.num_rows());
+
+        let limited_columns: Vec<ArrayRef> = input_batch
+            .columns()
+            .iter()
+            .map(|col| col.slice(0, output_rows))
+            .collect();
+
+        let limited_batch = RecordBatch::try_new(input_batch.schema(), limited_columns)
+            .map_err(|e| format!("Error creating limited batch: {}", e));
+
+        match limited_batch {
+            Ok(batch) => {
+                self.emitted += output_rows;
+                println!(
+                    "Emitted: {}, Batch Size: {}",
+                    self.emitted,
+                    batch.num_rows()
+                );
+
+                if self.emitted >= self.limit {
+                    if batch.num_rows() > 0 {
+                        return Result::Ok(Arc::new(batch));
+                    }
+                    Result::Done
+                } else {
+                    Result::Ok(Arc::new(batch))
+                }
+            }
+            Err(issue) => panic!("Encountered an issue {issue}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::str::FromStr;
-
     use super::*;
-    use datafusion::arrow::array::{Float64Array, Int32Array, Scalar};
+    use datafusion::arrow::array::{Float64Array, Int32Array};
     use datafusion::arrow::datatypes::{DataType, Field};
-    use datafusion::common::Column;
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::expressions;
-    use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
 
     #[test]
@@ -257,5 +380,109 @@ mod tests {
             }
             _ => panic!("Expected Done result"),
         }
+    }
+
+    struct TestSource {
+        data: Vec<Arc<RecordBatch>>,
+        index: usize,
+    }
+
+    impl TestSource {
+        fn new(data: Vec<Arc<RecordBatch>>) -> Self {
+            Self { data, index: 0 }
+        }
+    }
+
+    impl PhysicalOperator for TestSource {
+        fn kind(&self) -> Kind {
+            Kind::Source
+        }
+    }
+
+    impl PipelinedOperator for TestSource {
+        fn execute(&mut self, _: Arc<RecordBatch>) -> Result {
+            if self.index < self.data.len() {
+                let batch = self.data[self.index].clone();
+                self.index += 1;
+                Result::Ok(batch)
+            } else {
+                Result::Done
+            }
+        }
+    }
+
+    #[test]
+    fn projection_operator() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let batch = Arc::new(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                    Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3, 4.4, 5.5])),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let source = Box::new(TestSource::new(vec![batch]));
+        let mut projection = Projection::new(source, vec![1], schema.clone());
+
+        match projection.execute(Arc::new(RecordBatch::new_empty(schema))) {
+            Result::Ok(projected_batch) => {
+                assert_eq!(projected_batch.num_columns(), 1);
+                assert_eq!(projected_batch.num_rows(), 5);
+                let value_array = projected_batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                assert_eq!(value_array.value(0), 1.1);
+                assert_eq!(value_array.value(4), 5.5);
+            }
+            _ => panic!("Expected Done result"),
+        }
+    }
+
+    #[test]
+    fn limit_operator() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        let batch1 = Arc::new(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+        );
+
+        let batch2 = Arc::new(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+            )
+            .unwrap(),
+        );
+
+        let source = Box::new(TestSource::new(vec![batch1, batch2]));
+        let mut limit = Limit::new(source, 4);
+
+        let mut total_rows = 0;
+        loop {
+            match limit.execute(Arc::new(RecordBatch::new_empty(schema.clone()))) {
+                Result::Ok(limited_batch) => {
+                    println!("Limit.execute => {}", limited_batch.num_rows());
+                    total_rows += limited_batch.num_rows();
+                }
+                Result::Done => break,
+                _ => panic!("Unexpected result"),
+            }
+        }
+
+        assert_eq!(total_rows, 4);
     }
 }
