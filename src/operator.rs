@@ -4,10 +4,14 @@
 use datafusion::{
     arrow::{
         array::{ArrayRef, AsArray},
-        compute::{concat_batches, filter_record_batch, sort_to_indices, SortOptions},
+        compute::{
+            concat_batches, filter_record_batch, lexsort_to_indices, sort_to_indices, take,
+            SortOptions,
+        },
         datatypes::{Schema, SchemaRef},
         record_batch::RecordBatch,
     },
+    physical_expr::PhysicalSortExpr,
     physical_plan::{sorts::sort::sort_batch, PhysicalExpr},
 };
 use std::sync::Arc;
@@ -245,10 +249,72 @@ impl PipelinedOperator for Limit {
     }
 }
 
+pub struct Sort {
+    expr: Vec<PhysicalSortExpr>,
+    originals: Vec<RecordBatch>,
+}
+
+impl Sort {
+    pub fn new(expr: Vec<PhysicalSortExpr>) -> Self {
+        Self {
+            expr,
+            originals: Vec::new(),
+        }
+    }
+}
+
+impl PhysicalOperator for Sort {
+    fn kind(&self) -> Kind {
+        Kind::Sort
+    }
+}
+
+impl PipelinedOperator for Sort {
+    fn execute(&mut self, batch: Arc<RecordBatch>) -> Result {
+        self.originals.push(batch.as_ref().clone());
+        Result::Done
+    }
+}
+
+impl SinkOperator for Sort {
+    fn finalize(&self) -> Vec<Arc<RecordBatch>> {
+        let combined = concat_batches(&self.originals[0].schema(), self.originals.iter()).unwrap();
+
+        let sort_columns = self
+            .expr
+            .iter()
+            .map(|expr| expr.evaluate_to_sort_column(&combined).unwrap())
+            .collect::<Vec<_>>();
+
+        let indices = lexsort_to_indices(&sort_columns, None).unwrap();
+
+        let columns = combined
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &indices, None))
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+
+        let batch = RecordBatch::try_new(combined.schema(), columns).unwrap();
+        let size = 32;
+        let num_output_vec = (batch.num_rows() + size - 1) / size;
+        let mut output_vec = Vec::with_capacity(num_output_vec);
+        let mut output_offset: usize = 0;
+        loop {
+            if output_offset >= batch.num_rows() {
+                return output_vec;
+            }
+            let length = std::cmp::min(1024, batch.num_rows() - output_offset);
+            output_vec.push(Arc::new(batch.slice(output_offset, length)));
+            output_offset += length;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Float64Array, Int32Array};
+    use datafusion::arrow::array::{Float64Array, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::expressions;
@@ -484,5 +550,75 @@ mod tests {
         }
 
         assert_eq!(total_rows, 4);
+    }
+
+    #[test]
+    fn sort_operator() {
+        // Create a schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        // Create some test data
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 1, 4])),
+                Arc::new(StringArray::from(vec!["c", "a", "d"])),
+            ],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![5, 2])),
+                Arc::new(StringArray::from(vec!["e", "b"])),
+            ],
+        )
+        .unwrap();
+
+        // Create sort expressions
+        let sort_expr: Vec<PhysicalSortExpr> = vec![PhysicalSortExpr {
+            // expr: col("id", &schema).unwrap(),
+            expr: Arc::new(expressions::Column::new("id", 0)),
+            options: SortOptions::default(),
+        }];
+
+        // Create and execute the Sort operator
+        let mut sort = Sort::new(sort_expr);
+        sort.execute(Arc::new(batch1));
+        sort.execute(Arc::new(batch2));
+
+        // Finalize and get the sorted result
+        let result = sort.finalize();
+
+        // Verify the result
+        assert_eq!(result.len(), 1, "Expected 1 output batch");
+        let sorted_batch = result[0].as_ref();
+        assert_eq!(sorted_batch.num_rows(), 5, "Expected 5 rows in total");
+
+        // Check if the 'id' column is sorted
+        let id_array = sorted_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let sorted_ids: Vec<i32> = id_array.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(sorted_ids, vec![1, 2, 3, 4, 5], "IDs should be sorted");
+
+        // Check if the 'name' column is correctly ordered
+        let name_array = sorted_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sorted_names: Vec<&str> = name_array.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(
+            sorted_names,
+            vec!["a", "b", "c", "d", "e"],
+            "Names should be in corresponding order"
+        );
     }
 }
